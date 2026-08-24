@@ -41,7 +41,8 @@ python3 -m http.server 8000
 
 ## How It Works
 
-- **LLM API** — chat requests go to `https://text.pollinations.ai/openai` (OpenAI-compatible) with `stream: true`. The whole conversation history is sent so the model has context. No API key needed. If it returns a rate-limit error, the app retries with backoff, fails over to a secondary endpoint, and only then drops to local fallback replies.
+- **LLM API** — requests hit `/api/chat`, a tiny Vercel serverless function (`api/chat.js`) that proxies to the Pollinations API. The whole conversation history is sent so the model has context.
+- **API key** — set `POLLINATIONS_API_KEY` in your Vercel project env vars (or `.env.local` for `vercel dev`). Without a key the proxy falls back to Pollinations' anonymous free tier. The client also falls back to calling Pollinations directly if `/api/chat` is unavailable (e.g. opening `index.html` without a server).
 - **Streaming** — the SSE response is read chunk by chunk via `fetch` + `ReadableStream`; only `delta.content` tokens are rendered.
 - **Offline fallback** — if the request fails, `generateReply()` in `js/app.js` produces a local canned reply so the UI still works without internet.
 - **State** lives in a single object persisted to `localStorage` (`nova-chat-state`).

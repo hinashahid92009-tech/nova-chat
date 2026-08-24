@@ -1,7 +1,10 @@
 const STORAGE_KEY = "nova-chat-state";
 
-const API_URL = "https://text.pollinations.ai/openai";
-const API_FALLBACK_URLS = ["https://gen.pollinations.ai/v1/chat/completions"];
+const API_URL = "/api/chat";
+const API_FALLBACK_URLS = [
+  "https://text.pollinations.ai/openai",
+  "https://gen.pollinations.ai/v1/chat/completions"
+];
 const API_RETRIES = 2;
 const API_RETRY_DELAY = 1500;
 const SEND_COOLDOWN_MS = 2500;
