@@ -1,6 +1,10 @@
 const STORAGE_KEY = "nova-chat-state";
 
 const API_URL = "https://text.pollinations.ai/openai";
+const API_FALLBACK_URLS = ["https://gen.pollinations.ai/v1/chat/completions"];
+const API_RETRIES = 2;
+const API_RETRY_DELAY = 1500;
+const SEND_COOLDOWN_MS = 2500;
 const API_MODEL = "openai";
 const SYSTEM_PROMPT =
   "You are Nova, a friendly and helpful AI assistant inside a web app called Nova Chat. Be concise but complete, and use markdown formatting (including fenced code blocks) whenever it improves readability.";
@@ -43,6 +47,7 @@ const els = {
 let state = loadState();
 let generating = false;
 let currentAbort = null;
+let lastRequestAt = 0;
 
 function defaultState() {
   return { chats: [], activeChatId: null, theme: "dark" };
@@ -422,9 +427,46 @@ function createChat(firstMessage) {
   return chat;
 }
 
+async function openStream(messages, signal) {
+  const endpoints = [API_URL, ...API_FALLBACK_URLS];
+  let lastError = new Error("No endpoint available");
+
+  for (let attempt = 0; attempt < API_RETRIES; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, API_RETRY_DELAY));
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    }
+
+    for (const url of endpoints) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal,
+          body: JSON.stringify({ model: API_MODEL, stream: true, messages })
+        });
+
+        if (res.ok && res.body) return res;
+        lastError = new Error("Endpoint " + url + " responded with status " + res.status);
+      } catch (err) {
+        if (err.name === "AbortError") throw err;
+        lastError = err;
+      }
+    }
+  }
+  throw lastError;
+}
+
 async function respond() {
   const chat = getActiveChat();
   if (!chat || generating) return;
+
+  const sinceLast = Date.now() - lastRequestAt;
+  if (sinceLast < SEND_COOLDOWN_MS) {
+    await new Promise((r) => setTimeout(r, SEND_COOLDOWN_MS - sinceLast));
+    if (generating) return;
+  }
+  lastRequestAt = Date.now();
 
   const history = chat.messages.map(({ role, content }) => ({ role, content }));
   const lastUser = [...history].reverse().find((m) => m.role === "user");
@@ -442,18 +484,10 @@ async function respond() {
   currentAbort = new AbortController();
 
   try {
-    const res = await fetch(API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: currentAbort.signal,
-      body: JSON.stringify({
-        model: API_MODEL,
-        stream: true,
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history]
-      })
-    });
-
-    if (!res.ok || !res.body) throw new Error("API responded with status " + res.status);
+    const res = await openStream(
+      [{ role: "system", content: SYSTEM_PROMPT }, ...history],
+      currentAbort.signal
+    );
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -486,12 +520,16 @@ async function respond() {
     }
   } catch (err) {
     if (err.name !== "AbortError") {
+      const rateLimited = /status 40[24]|status 5\d\d/i.test(String(err));
       if (!placeholderMsg.content.trim()) {
         placeholderMsg.content =
-          "*Offline fallback — couldn't reach the AI service.*\n\n" +
+          "*Couldn't reach the AI service" +
+          (rateLimited ? " — the free tier is rate limited, wait a few seconds and try again" : "") +
+          ".*\n\n" +
           generateReply(lastUser ? lastUser.content : "");
       } else {
-        placeholderMsg.content += "\n\n*(connection lost)*";
+        placeholderMsg.content +=
+          "\n\n*(" + (rateLimited ? "rate limited — retry shortly" : "connection lost") + ")*";
       }
     }
   }

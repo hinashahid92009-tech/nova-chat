@@ -41,7 +41,7 @@ python3 -m http.server 8000
 
 ## How It Works
 
-- **LLM API** — chat requests go to `https://text.pollinations.ai/openai` (OpenAI-compatible) with `stream: true`. The whole conversation history is sent so the model has context. No API key needed.
+- **LLM API** — chat requests go to `https://text.pollinations.ai/openai` (OpenAI-compatible) with `stream: true`. The whole conversation history is sent so the model has context. No API key needed. If it returns a rate-limit error, the app retries with backoff, fails over to a secondary endpoint, and only then drops to local fallback replies.
 - **Streaming** — the SSE response is read chunk by chunk via `fetch` + `ReadableStream`; only `delta.content` tokens are rendered.
 - **Offline fallback** — if the request fails, `generateReply()` in `js/app.js` produces a local canned reply so the UI still works without internet.
 - **State** lives in a single object persisted to `localStorage` (`nova-chat-state`).
