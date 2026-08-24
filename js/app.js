@@ -1,5 +1,10 @@
 const STORAGE_KEY = "nova-chat-state";
 
+const API_URL = "https://text.pollinations.ai/openai";
+const API_MODEL = "openai";
+const SYSTEM_PROMPT =
+  "You are Nova, a friendly and helpful AI assistant inside a web app called Nova Chat. Be concise but complete, and use markdown formatting (including fenced code blocks) whenever it improves readability.";
+
 const ICONS = {
   dots: '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>',
   pencil: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>',
@@ -37,8 +42,7 @@ const els = {
 
 let state = loadState();
 let generating = false;
-let streamTimer = null;
-let streamDelay = null;
+let currentAbort = null;
 
 function defaultState() {
   return { chats: [], activeChatId: null, theme: "dark" };
@@ -322,8 +326,10 @@ function buildMessageEl(msg) {
     const content = document.createElement("div");
     content.className = "msg-content";
 
-    if (msg.formatted) {
-      content.innerHTML = msg.content ? formatMessage(msg.content) : typingDotsHtml();
+    if (msg.streaming && !msg.content) {
+      content.innerHTML = typingDotsHtml();
+    } else if (msg.formatted) {
+      content.innerHTML = formatMessage(msg.content);
     } else {
       content.textContent = msg.content;
     }
@@ -416,12 +422,12 @@ function createChat(firstMessage) {
   return chat;
 }
 
-function respond() {
+async function respond() {
   const chat = getActiveChat();
-  if (!chat) return;
+  if (!chat || generating) return;
 
-  const lastUser = [...chat.messages].reverse().find((m) => m.role === "user");
-  const fullReply = generateReply(lastUser ? lastUser.content : "");
+  const history = chat.messages.map(({ role, content }) => ({ role, content }));
+  const lastUser = [...history].reverse().find((m) => m.role === "user");
 
   setGenerating(true);
 
@@ -433,30 +439,73 @@ function respond() {
   scrollToBottom(true);
 
   const contentEl = msgEl.querySelector(".msg-content");
+  currentAbort = new AbortController();
 
-  streamDelay = setTimeout(() => {
-    const tokens = fullReply.match(/\S+\s*/g) || [fullReply];
-    let index = 0;
+  try {
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: currentAbort.signal,
+      body: JSON.stringify({
+        model: API_MODEL,
+        stream: true,
+        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history]
+      })
+    });
 
-    streamTimer = setInterval(() => {
-      if (index < tokens.length) {
-        placeholderMsg.content += tokens[index];
-        contentEl.textContent = placeholderMsg.content;
-        index++;
-        scrollToBottom();
-      } else {
-        finishStream(chat, placeholderMsg, contentEl);
+    if (!res.ok || !res.body) throw new Error("API responded with status " + res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine.startsWith("data:")) continue;
+        const payload = trimmedLine.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+
+        try {
+          const json = JSON.parse(payload);
+          const delta = json.choices?.[0]?.delta?.content;
+          if (delta) {
+            placeholderMsg.content += delta;
+            contentEl.textContent = placeholderMsg.content;
+            scrollToBottom();
+          }
+        } catch {}
       }
-    }, 28);
-  }, 650);
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      if (!placeholderMsg.content.trim()) {
+        placeholderMsg.content =
+          "*Offline fallback — couldn't reach the AI service.*\n\n" +
+          generateReply(lastUser ? lastUser.content : "");
+      } else {
+        placeholderMsg.content += "\n\n*(connection lost)*";
+      }
+    }
+  }
+
+  finishStream(chat, placeholderMsg, contentEl);
 }
 
 function finishStream(chat, msg, contentEl) {
-  clearInterval(streamTimer);
-  streamTimer = null;
+  currentAbort = null;
 
   msg.streaming = false;
   msg.formatted = true;
+  if (!msg.content.trim()) msg.content = "*Generation stopped.*";
+
   contentEl.innerHTML = formatMessage(msg.content);
   rebindCodeCopy(contentEl);
   refreshActions(chat, msg, contentEl);
@@ -489,43 +538,8 @@ function refreshActions(chat, msg, contentEl) {
 }
 
 function stopGeneration() {
-  if (!generating) return;
-
-  if (streamDelay) {
-    clearTimeout(streamDelay);
-    streamDelay = null;
-  }
-  const chatEarly = getActiveChat();
-  if (chatEarly && streamTimer === null) {
-    chatEarly.messages = chatEarly.messages.filter((m) => !m.streaming);
-    setGenerating(false);
-    saveState();
-    renderAll();
-    return;
-  }
-
-  if (!streamTimer) return;
-  clearInterval(streamTimer);
-  streamTimer = null;
-
-  const chat = getActiveChat();
-  if (!chat) return;
-  const msg = chat.messages[chat.messages.length - 1];
-  const lastEl = els.messages.querySelector(".msg:last-of-type .msg-content");
-
-  if (msg && msg.role === "assistant") {
-    msg.streaming = false;
-    msg.formatted = true;
-    if (lastEl) {
-      msg.content = msg.content || "(stopped)";
-      lastEl.innerHTML = formatMessage(msg.content);
-      rebindCodeCopy(lastEl);
-      refreshActions(chat, msg, lastEl);
-    }
-  }
-  setGenerating(false);
-  saveState();
-  renderChatList();
+  if (!generating || !currentAbort) return;
+  currentAbort.abort();
 }
 
 function sendMessage(text) {
